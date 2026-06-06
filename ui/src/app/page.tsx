@@ -12,7 +12,7 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    fetch('/data.json')
+    fetch(`${process.env.NEXT_PUBLIC_BASE_PATH ?? ''}/data.json`)
       .then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         return r.json()

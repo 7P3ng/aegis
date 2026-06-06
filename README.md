@@ -5,6 +5,8 @@ An adaptive attacker **agent** red-teams a target model on two harmless proxy th
 Two headline numbers, both produced by the harness and reproducible from committed fixtures at
 zero cost.
 
+**▶ Live dashboard: https://7p3ng.github.io/aegis/**
+
 <p align="center"><img src="docs/assets/hero.png" alt="Aegis dashboard hero" width="760"></p>
 
 > ### 🛡 Responsible red-teaming (non-negotiable)
