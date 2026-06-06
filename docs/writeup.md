@@ -19,7 +19,10 @@ here is produced by the harness and reproducible from committed fixtures with
 - **Benchmark.** 6 scenarios (3 canary data-exfiltration proxies + 3 injection
   instruction-hijack proxies) × 12 attack techniques. K = 2 (turn 0 is the single-turn
   baseline; turn 1 is one model-driven adaptive follow-up). 360 trials across the condition
-  matrix; 591 unique live calls; **$0.20** total (under the $1 cost gate).
+  matrix; 591 unique live calls (143,406 input + 430,754 output tokens). Cost **~$0.51**,
+  computed at deepseek-chat list prices ($0.27 / $1.10 per MTok); the actual deepseek-v4-pro
+  billing rate may differ, so this is an estimate from measured token counts, not a billed
+  figure. Well under the $1 cost gate.
 - **Attacker.** An agent that, on turn 0, emits a deterministic technique-rendered message
   (this *is* the single-turn baseline), then on turn 1 reads the target's refusal and crafts a
   new attack. Techniques span roleplay, fiction, base64/leetspeak/cross-language obfuscation,
@@ -39,13 +42,21 @@ here is produced by the harness and reproducible from committed fixtures with
 | Single-turn (turn 0) | **27.8%** | 18.1% – 38.9% | 72 |
 | 2-turn adaptive | **29.2%** | 19.4% – 40.3% | 72 |
 
-**Adaptation lift: +1.4%** (one cell flipped failure → success). The lift is real but small,
-and the honest reading is *why*: against this target, attacks that work tend to work on turn 0,
-and refusals are consistent enough that a single adaptive follow-up rarely flips them. By
-construction adaptive ASR ≥ single-turn ASR (turn 0 of the adaptive trial is the single-turn
-trial), so the comparison is apples-to-apples and the lift cannot be a sampling artifact of two
-separate runs. A deeper attacker (larger K, diversity search — see §6) is the obvious lever and
-is left as future work; the harness already takes `--k`.
+**Adaptation lift: +1.4% — and it is not statistically significant.** The single-turn and
+adaptive trials are *paired* by (scenario, technique), so the correct test is McNemar's on the
+discordant cells, not a comparison of the two overlapping marginal CIs above. Of the 72 paired
+cells: 20 both-success, 51 both-failure, and only the discordant cells matter — **b = 1**
+(one fail→success: `inject_doc_summary × many_shot`), **c = 0**. Exact two-sided McNemar
+**p = 1.0**. So the +1.4% is a single cell flipping, indistinguishable from noise. The harness
+computes and reports this (`adaptation_lift.significance` in `results/asr.json`).
+
+The honest reading: against this target a single adaptive follow-up does **not** measurably
+raise ASR — attacks that work tend to land on turn 0, and refusals are consistent. By
+construction adaptive ASR ≥ single-turn ASR (turn 0 of the adaptive trial *is* the single-turn
+trial), so this result verifies the harness and bounds the effect rather than demonstrating
+adaptation. The lever is a deeper attacker (larger K, diversity search — §6); the harness
+already takes `--k`. Reporting a careful null here is deliberate: the artifact's value is the
+measurement discipline, not a manufactured lift.
 
 ## 3. Claim 2 — defense reduction
 
@@ -56,7 +67,9 @@ is left as future work; the harness already takes `--k`.
 | + input classifier | 5.6% | 1.4% – 11.1% |
 | + output canary-scan (full stack) | **4.2%** | 0.0% – 8.3% |
 
-**Defense reduction: −25.0%** (29.2% → 4.2%). Per-layer marginal contributions:
+**Defense reduction: −25.0%** (29.2% → 4.2%). The none vs full-stack CIs are well separated
+(19.4–40.3% vs 0.0–8.3%), so the end-to-end reduction is solid. Adjacent-condition CIs
+overlap, so the per-layer marginals below are **directional**, not individually significant:
 
 - prompt-hardening: **−9.7%**
 - input classifier: **−13.9%** (the single biggest contributor; it blocked 134 attack

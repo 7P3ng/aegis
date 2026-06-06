@@ -17,6 +17,8 @@ function ci(lo: number, hi: number) {
 
 export function AsrHero({ adaptationLift, defenseCurve }: Props) {
   const liftPositive = adaptationLift.lift_abs >= 0
+  const sig = adaptationLift.significance
+  const significant = sig?.significant_at_05 ?? true
   const defReduction = defenseCurve.reduction_abs
   const fromAsr = defenseCurve.by_condition[defenseCurve.from_condition]
   const toAsr = defenseCurve.by_condition[defenseCurve.to_condition]
@@ -63,12 +65,12 @@ export function AsrHero({ adaptationLift, defenseCurve }: Props) {
             <div
               className="px-2 py-0.5 rounded text-[10px] font-mono"
               style={{
-                background: liftPositive ? 'var(--color-attack-bg)' : 'var(--color-hold-bg)',
-                color: liftPositive ? 'var(--color-attack)' : 'var(--color-hold)',
-                border: `1px solid ${liftPositive ? 'var(--color-attack-border)' : 'var(--color-hold-border)'}`,
+                background: significant ? 'var(--color-attack-bg)' : 'var(--color-surface-2)',
+                color: significant ? 'var(--color-attack)' : 'var(--color-text-tertiary)',
+                border: `1px solid ${significant ? 'var(--color-attack-border)' : 'var(--color-border)'}`,
               }}
             >
-              {liftPositive ? '+' : ''}{pct(adaptationLift.lift_abs)} lift
+              {liftPositive ? '+' : ''}{pct(adaptationLift.lift_abs)} lift{significant ? '' : ' · n.s.'}
             </div>
           </div>
 
@@ -188,6 +190,15 @@ export function AsrHero({ adaptationLift, defenseCurve }: Props) {
             }}
           >
             n={adaptationLift.adaptive_n} adaptive · n={adaptationLift.single_n} single · condition: none
+            {sig && (
+              <div className="mt-1">
+                McNemar exact p={sig.p_value} (discordant b={sig.b_single_fail_adaptive_success}/c=
+                {sig.c_single_success_adaptive_fail}) —{' '}
+                <span style={{ color: significant ? 'var(--color-attack)' : 'var(--color-text-secondary)' }}>
+                  {significant ? 'significant' : 'not significant'}
+                </span>{' '}at 0.05
+              </div>
+            )}
           </div>
         </div>
 

@@ -79,3 +79,43 @@ def test_heatmap_one_cell_per_scenario_technique():
     assert by_key[("s1", "t1")] is True
     assert by_key[("s1", "t2")] is False
     assert len(cells) == 3
+
+
+def test_mcnemar_one_flip_is_not_significant():
+    from evals.metrics import mcnemar
+    trials = []
+    # 5 both-success, 1 fail->success (the single discordant pair), rest both-fail
+    for i in range(6):
+        single = i < 5
+        adaptive = i < 6  # cell 5 flips fail(single)->success(adaptive)
+        trials.append(_trial("s", f"t{i}", "single", "none", single))
+        trials.append(_trial("s", f"t{i}", "adaptive", "none", adaptive))
+    m = mcnemar(trials)
+    assert m["b_single_fail_adaptive_success"] == 1
+    assert m["c_single_success_adaptive_fail"] == 0
+    assert m["discordant"] == 1
+    assert m["p_value"] == 1.0
+    assert m["significant_at_05"] is False
+
+
+def test_mcnemar_strong_effect_is_significant():
+    from evals.metrics import mcnemar
+    trials = []
+    for i in range(12):
+        # single all fail; adaptive succeeds on 10 of them -> b=10, c=0, p<0.05
+        trials.append(_trial("s", f"t{i}", "single", "none", False))
+        trials.append(_trial("s", f"t{i}", "adaptive", "none", i < 10))
+    m = mcnemar(trials)
+    assert m["b_single_fail_adaptive_success"] == 10
+    assert m["c_single_success_adaptive_fail"] == 0
+    assert m["significant_at_05"] is True
+
+
+def test_adaptation_lift_includes_significance():
+    trials = []
+    for i in range(6):
+        trials.append(_trial("s", f"t{i}", "single", "none", i < 2))
+        trials.append(_trial("s", f"t{i}", "adaptive", "none", i < 4))
+    lift = adaptation_lift(trials)
+    assert "significance" in lift
+    assert "p_value" in lift["significance"]

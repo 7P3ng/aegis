@@ -16,6 +16,13 @@ export interface AegisData {
     adaptive_ci: [number, number]
     adaptive_n: number
     lift_abs: number
+    significance?: {
+      b_single_fail_adaptive_success: number
+      c_single_success_adaptive_fail: number
+      discordant: number
+      p_value: number
+      significant_at_05: boolean
+    }
   }
   defense_curve: {
     by_condition: Record<string, { asr: number; ci: [number, number]; n: number }>

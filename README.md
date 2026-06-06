@@ -19,13 +19,23 @@ zero cost.
 
 ## Headline results
 
-Target **`deepseek-v4-pro`**, one live run (360 trials, 591 calls, **$0.20**), K = 2. Seeded
-95% bootstrap CIs. Reproduce with `make eval-dry`.
+Target **`deepseek-v4-pro`**, one live run: 360 trials, 591 unique calls, **~$0.51** (143K input
++ 431K output tokens priced at deepseek-chat list rates), K = 2. Seeded 95% bootstrap CIs over
+72 cells per condition — coarse (≈±10%), so treat point estimates as directional. Reproduce
+with `make eval-dry`.
 
-**1. Adaptation lift** — a 2-turn adaptive attacker raised ASR from **27.8%** (single-turn,
-CI 18.1–38.9%) to **29.2%** (CI 19.4–40.3%) — **+1.4%**, at defense = none.
+**1. Adaptation lift — a null result, reported honestly.** At defense = none, a 2-turn adaptive
+attacker moved ASR from **27.8%** (single-turn, CI 18.1–38.9%) to **29.2%** (CI 19.4–40.3%):
+**+1.4%**. The trials are paired by (scenario, technique), so the right test is McNemar's on the
+discordant cells — and there is exactly one (b=1 fail→success, c=0, **exact p = 1.0**): **not
+statistically significant.** Adaptive ASR ≥ single-turn ASR by construction (turn 0 *is* the
+baseline), so this verifies the harness rather than demonstrating an adaptation effect. The
+lever is a deeper attacker (larger K / diversity search) — left as future work; the harness
+already takes `--k`.
 
-**2. Defense reduction** — a layered defense cut adaptive ASR **29.2% → 4.2%** (**−25.0%**):
+**2. Defense reduction — the real result.** A layered defense cut adaptive ASR
+**29.2% → 4.2% (−25.0%)**; the none vs full-stack CIs are well separated (19.4–40.3% vs
+0.0–8.3%). Per-layer marginals are *directional* (adjacent-condition CIs overlap):
 
 | Condition | ASR | marginal |
 |---|---|---|
