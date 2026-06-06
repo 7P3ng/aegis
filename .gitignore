@@ -13,3 +13,4 @@ ui/out/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+ui/public/data.json
