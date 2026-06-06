@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520" font-family="ui-monospace,Menlo,Consolas,monospace">
+  <rect width="900" height="520" fill="#0a0a0b"/>
+  <style>
+    .box{fill:#141416;stroke:#2a2a2e;stroke-width:1.5;rx:8}
+    .k{fill:#101012;stroke:#26323a;stroke-width:1.5}
+    .t{fill:#e7e7ea;font-size:13px}
+    .s{fill:#8a8a93;font-size:11px}
+    .lbl{fill:#9aa3ab;font-size:11px}
+    .red{fill:#e5484d}.grn{fill:#46a758}.amb{fill:#e2a336}
+    .arr{stroke:#3a3a40;stroke-width:1.6;fill:none;marker-end:url(#a)}
+    .hd{fill:#cfcfd4;font-size:12px;letter-spacing:1px}
+  </style>
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#5a5a62"/>
+    </marker>
+  </defs>
+
+  <text x="32" y="40" class="hd">AEGIS — AUTOMATED RED-TEAM GAUNTLET</text>
+  <text x="32" y="58" class="s">harmless proxies · deterministic scoring · layered defenses</text>
+
+  <!-- redteam loop -->
+  <text x="32" y="96" class="lbl">redteam/  (one trial, up to K turns)</text>
+
+  <rect class="box" x="32" y="110" width="150" height="64" rx="8"/>
+  <text x="46" y="138" class="t">Attacker agent</text>
+  <text x="46" y="156" class="s">turn0 = baseline</text>
+
+  <rect class="box" x="250" y="110" width="170" height="64" rx="8"/>
+  <text x="264" y="132" class="t">Target adapter</text>
+  <text x="264" y="150" class="s">policy + untrusted</text>
+  <text x="264" y="164" class="s">data framing</text>
+
+  <rect class="box" x="488" y="110" width="170" height="64" rx="8"/>
+  <text x="502" y="132" class="t">Deterministic</text>
+  <text x="502" y="150" class="t">judge</text>
+  <text x="502" y="164" class="s">exact string / sentinel</text>
+
+  <!-- defenses stacked under target -->
+  <rect class="box" x="250" y="208" width="170" height="92" rx="8"/>
+  <text x="264" y="230" class="lbl">defenses (stack)</text>
+  <circle cx="270" cy="248" r="4" class="amb"/><text x="282" y="252" class="s">prompt-hardening</text>
+  <circle cx="270" cy="268" r="4" class="red"/><text x="282" y="272" class="s">input classifier</text>
+  <circle cx="270" cy="288" r="4" class="grn"/><text x="282" y="292" class="s">output canary-scan</text>
+
+  <!-- arrows loop -->
+  <path class="arr" d="M182,142 L248,142"/>
+  <text x="196" y="134" class="s">attack</text>
+  <path class="arr" d="M420,142 L486,142"/>
+  <text x="432" y="134" class="s">response</text>
+  <path class="arr" d="M560,174 C560,210 230,210 200,176" />
+  <text x="360" y="206" class="s">refusal → adapt (≤K)</text>
+  <path class="arr" d="M335,208 L335,176"/>
+
+  <!-- eval + ui -->
+  <text x="32" y="356" class="lbl">evals/  →  ui/</text>
+
+  <rect class="box" x="32" y="370" width="180" height="70" rx="8"/>
+  <text x="46" y="396" class="t">gauntlet runner</text>
+  <text x="46" y="414" class="s">360 trials, parallel</text>
+  <text x="46" y="428" class="s">cost-gated + degraded guard</text>
+
+  <rect class="box" x="262" y="370" width="180" height="70" rx="8"/>
+  <text x="276" y="396" class="t">metrics</text>
+  <text x="276" y="414" class="s">ASR · ablations</text>
+  <text x="276" y="428" class="s">bootstrap 95% CIs</text>
+
+  <rect class="box" x="492" y="370" width="180" height="70" rx="8"/>
+  <text x="506" y="396" class="t">results + export</text>
+  <text x="506" y="414" class="s">json · md · fixtures</text>
+  <text x="506" y="428" class="s">(dry-run reproduces)</text>
+
+  <rect class="box" x="722" y="370" width="146" height="70" rx="8"/>
+  <text x="736" y="396" class="t">dashboard</text>
+  <text x="736" y="414" class="s">hero · heatmap</text>
+  <text x="736" y="428" class="s">ablation · attack log</text>
+
+  <path class="arr" d="M212,405 L260,405"/>
+  <path class="arr" d="M442,405 L490,405"/>
+  <path class="arr" d="M672,405 L720,405"/>
+
+  <!-- kernel layer -->
+  <rect class="k" x="32" y="462" width="836" height="40" rx="8"/>
+  <text x="46" y="486" class="lbl">core/ — vendored Quorum kernel:</text>
+  <text x="270" y="486" class="s">ModelClient seam (Fake / Recorded / DeepSeek) · SQLite tracing · fan-out orchestrator · pricing · bootstrap CIs</text>
+</svg>
