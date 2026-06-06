@@ -18,13 +18,15 @@ import argparse
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 from core.model_client import ModelClient, RecordedClient, estimate_tokens, prompt_key
+from core.orchestrator import fan_out, retry
 from core.pricing import cost
 from core.tracing import TraceStore
-from core.types import ModelResponse
+from core.types import ModelResponse, RateLimitError
 from evals import metrics
 from redteam.attacker import Attacker
 from redteam.defenses import CONDITIONS, defense_for_condition
@@ -35,6 +37,7 @@ from redteam.techniques import TECHNIQUES, Technique
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = ROOT / "evals" / "fixtures"
+PROVENANCE = FIXTURES_DIR / "provenance.json"
 RESULTS_DIR = ROOT / "evals" / "results"
 
 DEFAULT_K = 2
@@ -75,30 +78,51 @@ def build_plan(scenarios: list[Scenario], techniques: list[Technique]) -> list[T
 class RecordingClient:
     """Wraps a real client; calls each unique prompt at most once and records the response.
 
-    Memoization makes the live run self-consistent with the fixtures it writes, so the dry-run
-    replay is exact even though the underlying model is nondeterministic.
+    Thread-safe single-flight: concurrent calls with the same key collapse into one live call,
+    so the recorded fixtures stay exactly consistent with what every trial saw and the dry-run
+    replay is exact even under parallelism and model nondeterminism. Rate limits are retried.
     """
 
     def __init__(self, inner: ModelClient) -> None:
         self._inner = inner
         self.fixtures: dict[str, dict[str, Any]] = {}
         self._cache: dict[str, ModelResponse] = {}
+        self._inflight: dict[str, threading.Event] = {}
+        self._lock = threading.Lock()
         self.live_calls = 0
+        self.total_cost = 0.0
 
     def complete(self, *, model, system, messages, max_tokens) -> ModelResponse:
         key = prompt_key(model, system, messages)
-        if key in self._cache:
-            return self._cache[key]
-        resp = self._inner.complete(
-            model=model, system=system, messages=messages, max_tokens=max_tokens
+        with self._lock:
+            if key in self._cache:
+                return self._cache[key]
+            ev = self._inflight.get(key)
+            owner = ev is None
+            if owner:
+                ev = threading.Event()
+                self._inflight[key] = ev
+        assert ev is not None  # owner created it; non-owner read an existing one
+        if not owner:
+            ev.wait()
+            with self._lock:
+                return self._cache[key]
+        resp = retry(
+            lambda: self._inner.complete(
+                model=model, system=system, messages=messages, max_tokens=max_tokens
+            ),
+            attempts=4, backoff=1.0, exceptions=(RateLimitError,),
         )
-        self.live_calls += 1
-        self._cache[key] = resp
-        self.fixtures[key] = {
-            "text": resp.text, "model": resp.model,
-            "input_tokens": resp.input_tokens, "output_tokens": resp.output_tokens,
-            "latency_ms": resp.latency_ms, "stop_reason": resp.stop_reason,
-        }
+        with self._lock:
+            self._cache[key] = resp
+            self.fixtures[key] = {
+                "text": resp.text, "model": resp.model,
+                "input_tokens": resp.input_tokens, "output_tokens": resp.output_tokens,
+                "latency_ms": resp.latency_ms, "stop_reason": resp.stop_reason,
+            }
+            self.live_calls += 1
+            self.total_cost += resp.cost_usd
+        ev.set()
         return resp
 
 
@@ -132,50 +156,57 @@ _NULL_CLIENT = _NullClient()
 # --- run loop -----------------------------------------------------------------------------
 def run_plan(
     plan: list[TrialSpec], client: ModelClient, *, k: int, trace: TraceStore, run_id: str,
-    max_usd: float | None = None,
-) -> list[TrialResult]:
-    """Execute every trial. Aborts (raises) if cumulative cost reaches the cap."""
+    max_usd: float | None = None, concurrency: int = 8,
+) -> list[TrialResult | None]:
+    """Execute every trial concurrently. A trial that breaches the cost cap or errors becomes
+    ``None`` (the degraded guard then aborts cleanly). Single-flight recording keeps the run
+    reproducible despite parallelism."""
     attacker = Attacker(client)
     target = TargetAdapter(client, max_tokens=TARGET_MAX_TOKENS)
-    results: list[TrialResult] = []
-    for spec in plan:
+
+    def one(spec: TrialSpec) -> TrialResult:
+        if max_usd is not None and getattr(client, "total_cost", 0.0) >= max_usd:
+            raise RuntimeError(f"cost cap ${max_usd:.2f} reached before trial")
         defense = defense_for_condition(spec.condition, classifier_client=client)
-        r = run_trial(
+        return run_trial(
             spec.scenario, spec.technique, mode=spec.mode, k=k,
             attacker=attacker, target=target, defense=defense, condition=spec.condition,
             trace=trace, run_id=run_id,
         )
-        results.append(r)
-        if max_usd is not None:
-            spent = sum(s["total_cost_usd"] for s in trace.query_runs() if s["run_id"] == run_id)
-            if spent >= max_usd:
-                raise SystemExit(
-                    f"ABORT: live cost ${spent:.4f} reached the cap ${max_usd:.2f} after "
-                    f"{len(results)} trials. No ASR emitted (degraded run)."
-                )
-    return results
+
+    return fan_out(plan, one, max_concurrency=concurrency)
 
 
-def assert_not_degraded(results: list[TrialResult], expected_trials: int, n_techniques: int) -> None:
+
+def assert_not_degraded(
+    results: list[TrialResult | None], expected_trials: int, n_techniques: int
+) -> list[TrialResult]:
     """Fail loud on a truncated/empty run rather than emitting a fabricated 0% headline."""
-    if len(results) != expected_trials:
+    failed = sum(1 for r in results if r is None)
+    if failed:
         raise SystemExit(
-            f"ABORT (degraded): ran {len(results)} trials, expected {expected_trials}."
+            f"ABORT (degraded): {failed} trials failed (cost cap or API error). No ASR emitted."
         )
-    techniques_attempted = {r.technique_id for r in results}
+    ok = [r for r in results if r is not None]
+    if len(ok) != expected_trials:
+        raise SystemExit(
+            f"ABORT (degraded): ran {len(ok)} trials, expected {expected_trials}."
+        )
+    techniques_attempted = {r.technique_id for r in ok}
     if len(techniques_attempted) != n_techniques:
         raise SystemExit(
             f"ABORT (degraded): {len(techniques_attempted)} techniques attempted, "
             f"expected {n_techniques}."
         )
     non_empty = sum(
-        1 for r in results for turn in r.transcript if turn.target and turn.target.strip()
+        1 for r in ok for turn in r.transcript if turn.target and turn.target.strip()
     )
     if non_empty == 0:
         raise SystemExit(
             "ABORT (degraded): every target response was empty — likely the reasoning model "
             "truncated on max_tokens. Refusing to write a 0% headline."
         )
+    return ok
 
 
 # --- summary + outputs --------------------------------------------------------------------
@@ -276,6 +307,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target", default="deepseek", choices=["deepseek"])
     p.add_argument("--k", type=int, default=DEFAULT_K)
     p.add_argument("--max-usd", type=float, default=float(os.environ.get("AEGIS_MAX_USD", DEFAULT_MAX_USD)))
+    p.add_argument("--concurrency", type=int, default=8)
     args = p.parse_args(argv)
 
     plan = build_plan(SCENARIOS, TECHNIQUES)
@@ -293,19 +325,34 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Refusing: estimate ${est:.4f} exceeds cap ${args.max_usd:.2f}.", file=sys.stderr)
             return 2
         client: ModelClient = RecordingClient(_build_live_client())
-        results = run_plan(plan, client, k=args.k, trace=trace, run_id=run_id, max_usd=args.max_usd)
-        assert_not_degraded(results, len(plan), len(TECHNIQUES))
+        raw = run_plan(plan, client, k=args.k, trace=trace, run_id=run_id,
+                       max_usd=args.max_usd, concurrency=args.concurrency)
+        results = assert_not_degraded(raw, len(plan), len(TECHNIQUES))
         FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
         (FIXTURES_DIR / "deepseek.json").write_text(json.dumps(client.fixtures, indent=2))  # type: ignore[attr-defined]
         spent = sum(s["total_cost_usd"] for s in trace.query_runs() if s["run_id"] == run_id)
-        print(f"[cost] actual ${spent:.4f} over {client.live_calls} unique live calls.")  # type: ignore[attr-defined]
+        live_calls = client.live_calls  # type: ignore[attr-defined]
+        target_model = os.environ.get("OSSLLM_MODEL", "deepseek-v4-pro")
+        PROVENANCE.write_text(json.dumps({
+            "source": "live", "target_model": target_model, "k": args.k,
+            "live_calls": live_calls, "cost_usd": round(spent, 4),
+        }, indent=2))
+        print(f"[cost] actual ${spent:.4f} over {live_calls} unique live calls.")
     else:
         fixtures = _load_fixtures()
         client = RecordedClient(fixtures, strict=True)
-        results = run_plan(plan, client, k=args.k, trace=trace, run_id=run_id)
-        assert_not_degraded(results, len(plan), len(TECHNIQUES))
+        raw = run_plan(plan, client, k=args.k, trace=trace, run_id=run_id,
+                       concurrency=args.concurrency)
+        results = assert_not_degraded(raw, len(plan), len(TECHNIQUES))
 
-    summary = summarize(results, target=args.target, mode_k=args.k, live=args.live)
+    prov = json.loads(PROVENANCE.read_text()) if PROVENANCE.exists() else None
+    is_live_data = bool(prov and prov.get("source") == "live")
+    target_label = args.target
+    if is_live_data and prov is not None:
+        target_label = prov["target_model"]
+    summary = summarize(results, target=target_label, mode_k=args.k, live=is_live_data)
+    if prov:
+        summary["meta"]["provenance"] = prov
     write_outputs(summary, results)
     lift = summary["adaptation_lift"]
     curve = summary["defense_curve"]

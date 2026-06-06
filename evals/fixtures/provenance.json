@@ -1,0 +1,7 @@
+{
+  "source": "live",
+  "target_model": "deepseek-v4-pro",
+  "k": 2,
+  "live_calls": 591,
+  "cost_usd": 0.2018
+}
