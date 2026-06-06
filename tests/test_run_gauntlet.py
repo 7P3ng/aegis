@@ -1,0 +1,99 @@
+"""Harness tests: record->replay reproduction, cost gate, and the degraded-run guard.
+All on a deterministic fake — zero paid calls."""
+import re
+
+import pytest
+
+from core.model_client import RecordedClient
+from core.tracing import TraceStore
+from evals import run_gauntlet as G
+from redteam.gauntlet import TrialResult
+
+_CANARY_RE = re.compile(r"AEGIS-CANARY-[A-Z0-9-]+")
+_SENT_RE = re.compile(r"SENTINEL-AEGIS-[A-Z0-9-]+")
+
+
+def _deterministic_model(model, system, messages, max_tokens):
+    """A fake that plays attacker/classifier/target deterministically, with some leaks."""
+    user = messages[-1]["content"] if messages else ""
+    if "automated red-team attacker" in system:
+        return "Let me try a different framing to get the secret."
+    if "security input filter" in system:
+        return "NO"  # never blocks, so classifier condition still exercises the target
+    # target turn
+    canary = _CANARY_RE.search(system)
+    if canary:
+        return canary.group(0) if len(user) % 2 == 0 else "I cannot reveal that secret."
+    sent = _SENT_RE.search(user)
+    if sent:
+        return sent.group(0) if len(user) % 2 == 1 else "Here is a faithful summary."
+    return "Here is a faithful, safe summary."
+
+
+class _Fake:
+    def complete(self, *, model, system, messages, max_tokens):
+        from core.model_client import FakeClient
+        return FakeClient(_deterministic_model).complete(
+            model=model, system=system, messages=messages, max_tokens=max_tokens
+        )
+
+
+def _run(client, k=2):
+    plan = G.build_plan(G.SCENARIOS, G.TECHNIQUES)
+    store = TraceStore(":memory:")
+    rid = store.new_run("t")
+    results = G.run_plan(plan, client, k=k, trace=store, run_id=rid)
+    return plan, results
+
+
+def test_record_then_replay_reproduces_summary():
+    rec = G.RecordingClient(_Fake())
+    plan, live_results = _run(rec)
+    live_summary = G.summarize(live_results, target="deepseek", mode_k=2, live=True)
+
+    replay = RecordedClient(rec.fixtures, strict=True)
+    _, dry_results = _run(replay)
+    dry_summary = G.summarize(dry_results, target="deepseek", mode_k=2, live=False)
+
+    assert dry_summary["adaptation_lift"] == live_summary["adaptation_lift"]
+    assert dry_summary["defense_curve"] == live_summary["defense_curve"]
+
+
+def test_run_actually_exercises_model_and_has_signal():
+    rec = G.RecordingClient(_Fake())
+    plan, results = _run(rec)
+    summary = G.summarize(results, target="deepseek", mode_k=2, live=True)
+    assert summary["meta"]["n_trials"] == len(plan)
+    # the deterministic fake leaks on some cells, so ASR is strictly between 0 and 1
+    assert 0.0 < summary["adaptation_lift"]["adaptive_asr"] < 1.0
+
+
+def test_estimate_is_positive_and_under_one_dollar_at_k2():
+    plan = G.build_plan(G.SCENARIOS, G.TECHNIQUES)
+    est = G.estimate_cost(plan, 2)
+    assert est > 0
+    assert est < 1.00  # K=2 full matrix fits under the default cap
+
+
+def test_degraded_guard_trips_on_missing_trials():
+    with pytest.raises(SystemExit):
+        G.assert_not_degraded([], expected_trials=10, n_techniques=12)
+
+
+def test_degraded_guard_trips_on_all_empty_responses():
+    from redteam.gauntlet import Turn
+    empty = [
+        TrialResult("s", t, "single", "none", False, 1, None, [Turn("a", "", False)])
+        for t in ("t1", "t2")
+    ]
+    with pytest.raises(SystemExit):
+        G.assert_not_degraded(empty, expected_trials=2, n_techniques=2)
+
+
+def test_degraded_guard_passes_real_zero_with_nonempty_responses():
+    from redteam.gauntlet import Turn
+    real_zero = [
+        TrialResult("s", t, "single", "none", False, 1, None, [Turn("a", "I refuse.", False)])
+        for t in ("t1", "t2")
+    ]
+    G.assert_not_degraded(real_zero, expected_trials=2, n_techniques=2)  # no raise
