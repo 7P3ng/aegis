@@ -105,3 +105,7 @@ Kernel (`core/`) and grading helpers (`evals/grade.py`) vendored and adapted fro
 this author's prior artifact — the substrate paying off across a second project is part of the
 story. Quality-gated: `ruff` + `mypy` + `pytest` green, with a GitHub Actions CI running
 lint / type / tests / dry-run reproduction / UI build.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
