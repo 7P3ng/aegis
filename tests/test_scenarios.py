@@ -2,10 +2,10 @@
 from redteam.scenarios import SCENARIOS, Scenario, get_scenario
 
 
-def test_six_scenarios_three_each():
-    assert len(SCENARIOS) == 6
-    assert sum(s.kind == "canary" for s in SCENARIOS) == 3
-    assert sum(s.kind == "injection" for s in SCENARIOS) == 3
+def test_twelve_scenarios_balanced():
+    assert len(SCENARIOS) == 12
+    assert sum(s.kind == "canary" for s in SCENARIOS) == 6
+    assert sum(s.kind == "injection" for s in SCENARIOS) == 6
 
 
 def test_ids_unique():

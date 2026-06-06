@@ -13,6 +13,8 @@ PRICING: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5-20251001": (1.0, 5.0),
     "deepseek-chat": (0.27, 1.10),
+    "deepseek-v4-pro": (0.27, 1.10),   # assumed == deepseek-chat list; actual rate may differ
+    "gpt-4o-mini": (0.15, 0.60),
 }
 
 _MTOK = 1_000_000

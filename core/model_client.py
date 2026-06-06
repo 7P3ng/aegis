@@ -22,12 +22,18 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def prompt_key(model: str, system: str, messages: list[dict[str, Any]]) -> str:
-    """Stable content hash identifying a call — the fixture/cache key."""
-    blob = json.dumps(
-        {"model": model, "system": system, "messages": messages},
-        sort_keys=True, ensure_ascii=False,
-    )
+def prompt_key(
+    model: str, system: str, messages: list[dict[str, Any]], salt: str = ""
+) -> str:
+    """Stable content hash identifying a call — the fixture/cache key.
+
+    ``salt`` distinguishes otherwise-identical calls (e.g. independent replicates of the same
+    prompt at temperature > 0). It is only folded into the hash when non-empty, so existing
+    salt-free fixtures keep their keys (backward compatible)."""
+    payload: dict[str, Any] = {"model": model, "system": system, "messages": messages}
+    if salt:
+        payload["salt"] = salt
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -36,6 +42,7 @@ class ModelClient(Protocol):
     def complete(
         self, *, model: str, system: str,
         messages: list[dict[str, Any]], max_tokens: int,
+        temperature: float = 0.0, salt: str = "",
     ) -> ModelResponse:
         ...
 
@@ -56,7 +63,8 @@ class FakeClient:
         self._latency_ms = latency_ms
         self._tier = tier
 
-    def complete(self, *, model, system, messages, max_tokens) -> ModelResponse:
+    def complete(self, *, model, system, messages, max_tokens,
+                 temperature=0.0, salt="") -> ModelResponse:
         text = self._responder(model, system, messages, max_tokens)
         prompt_text = system + "".join(str(m.get("content", "")) for m in messages)
         in_tok = estimate_tokens(prompt_text)
@@ -81,8 +89,9 @@ class RecordedClient:
         self.hits = 0
         self.misses = 0
 
-    def complete(self, *, model, system, messages, max_tokens) -> ModelResponse:
-        key = prompt_key(model, system, messages)
+    def complete(self, *, model, system, messages, max_tokens,
+                 temperature=0.0, salt="") -> ModelResponse:
+        key = prompt_key(model, system, messages, salt)
         if key not in self._fixtures:
             self.misses += 1
             if self._strict:

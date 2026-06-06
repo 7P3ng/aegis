@@ -31,10 +31,11 @@ def _deterministic_model(model, system, messages, max_tokens):
 
 
 class _Fake:
-    def complete(self, *, model, system, messages, max_tokens):
+    def complete(self, *, model, system, messages, max_tokens, temperature=0.0, salt=""):
         from core.model_client import FakeClient
         return FakeClient(_deterministic_model).complete(
-            model=model, system=system, messages=messages, max_tokens=max_tokens
+            model=model, system=system, messages=messages, max_tokens=max_tokens,
+            temperature=temperature, salt=salt,
         )
 
 
@@ -68,11 +69,19 @@ def test_run_actually_exercises_model_and_has_signal():
     assert 0.0 < summary["adaptation_lift"]["adaptive_asr"] < 1.0
 
 
-def test_estimate_is_positive_and_under_one_dollar_at_k2():
-    plan = G.build_plan(G.SCENARIOS, G.TECHNIQUES)
-    est = G.estimate_cost(plan, 2)
-    assert est > 0
-    assert est < 1.00  # K=2 full matrix fits under the default cap
+def test_estimate_is_positive_and_model_aware():
+    plan = G.build_plan(G.SCENARIOS, G.TECHNIQUES)  # n=1 baseline
+    vpro = G.estimate_cost(plan, 2, target_model="deepseek-v4-pro", attacker_model="deepseek-chat")
+    gpt = G.estimate_cost(plan, 2, target_model="gpt-4o-mini", attacker_model="deepseek-chat")
+    assert vpro > 0 and gpt > 0
+    assert gpt < vpro  # a cheaper, non-reasoning target costs less to estimate
+
+
+def test_replicates_scale_the_plan():
+    base = G.build_plan(G.SCENARIOS, G.TECHNIQUES, replicates=1)
+    trip = G.build_plan(G.SCENARIOS, G.TECHNIQUES, replicates=3)
+    assert len(trip) == 3 * len(base)
+    assert {sp.replicate for sp in trip} == {0, 1, 2}
 
 
 def test_degraded_guard_trips_on_missing_trials():
@@ -97,3 +106,15 @@ def test_degraded_guard_passes_real_zero_with_nonempty_responses():
         for t in ("t1", "t2")
     ]
     G.assert_not_degraded(real_zero, expected_trials=2, n_techniques=2)  # no raise
+
+
+
+def test_degraded_guard_tolerates_rare_empties():
+    from redteam.gauntlet import Turn
+    trials = [
+        TrialResult("s", f"t{i}", "single", "none", False, 1, None, [Turn("a", "I refuse.", False)])
+        for i in range(40)
+    ]
+    # one trial all-empty = 1/40 = 2.5% <= 5% threshold -> tolerated, not aborted
+    trials[0].transcript = [Turn("a", "", False)]
+    G.assert_not_degraded(trials, expected_trials=40, n_techniques=40)  # no raise

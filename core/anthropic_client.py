@@ -25,11 +25,13 @@ class AnthropicClient:
         self._anthropic = anthropic
         self._client = anthropic.Anthropic(api_key=key)
 
-    def complete(self, *, model, system, messages, max_tokens) -> ModelResponse:
+    def complete(self, *, model, system, messages, max_tokens,
+                 temperature=0.0, salt="") -> ModelResponse:
         t0 = perf_counter()
         try:
             resp = self._client.messages.create(
-                model=model, system=system, max_tokens=max_tokens, messages=messages,
+                model=model, system=system, max_tokens=max_tokens,
+                messages=messages, temperature=temperature,
             )
         except self._anthropic.RateLimitError as exc:
             raise RateLimitError(str(exc)) from exc

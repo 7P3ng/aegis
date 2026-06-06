@@ -28,7 +28,7 @@ class Defense(Protocol):
 
     harden: bool
 
-    def classify(self, message: str) -> str | None:
+    def classify(self, message: str, *, temperature: float = 0.0, salt: str = "") -> str | None:
         """Return a blocking-layer name if the incoming message is flagged, else None."""
         ...
 
@@ -40,7 +40,7 @@ class Defense(Protocol):
 class _NoDefense:
     harden = False
 
-    def classify(self, message: str) -> str | None:
+    def classify(self, message: str, *, temperature: float = 0.0, salt: str = "") -> str | None:
         return None
 
     def scan(self, scenario: Scenario, text: str) -> str | None:
@@ -68,6 +68,8 @@ class TrialResult:
     turns_used: int
     blocked_by: str | None
     transcript: list[Turn] = field(default_factory=list)
+    replicate: int = 0
+    target: str = ""     # the target model id under test (cross-model runs)
 
 
 def run_trial(
@@ -80,11 +82,15 @@ def run_trial(
     target: TargetAdapter,
     defense: Defense = NO_DEFENSE,
     condition: str = "none",
+    replicate: int = 0,
+    temperature: float = 0.0,
+    target_model: str = "",
     trace: TraceStore | None = None,
     run_id: str | None = None,
     parent: str | None = None,
 ) -> TrialResult:
     """Run one trial to completion (success or K turns exhausted)."""
+    salt = f"rep{replicate}"
     max_turns = 1 if mode == "single" else max(1, k)
     history: list[tuple[str, str]] = []
     transcript: list[Turn] = []
@@ -92,18 +98,23 @@ def run_trial(
     blocked_by: str | None = None
 
     for turn_idx in range(max_turns):
-        attacker_msg = attacker.next_message(scenario, technique, history)
+        attacker_msg = attacker.next_message(
+            scenario, technique, history, temperature=temperature, salt=salt
+        )
 
         turn_blocked: str | None = None
         turn_resp = None  # the priced ModelResponse, when a target call happened
-        flagged = defense.classify(attacker_msg)
+        flagged = defense.classify(attacker_msg, temperature=temperature, salt=salt)
         if flagged:
             # Input classifier blocked the message before it reached the target.
             turn_blocked = flagged
             visible_target = "[BLOCKED BY INPUT CLASSIFIER]"
             judged_text = ""
         else:
-            turn_resp = target.run_turn(scenario, attacker_msg, harden=defense.harden)
+            turn_resp = target.run_turn(
+                scenario, attacker_msg, harden=defense.harden,
+                temperature=temperature, salt=salt,
+            )
             target_text = turn_resp.text
             scanned = defense.scan(scenario, target_text)
             if scanned:
@@ -129,7 +140,8 @@ def run_trial(
                     sp.record_response(turn_resp)  # price the real model call
                 sp.set(
                     scenario=scenario.id, technique=technique.id, mode=mode,
-                    condition=condition, turn=turn_idx, success=turn_success,
+                    condition=condition, replicate=replicate, target_model=target_model,
+                    turn=turn_idx, success=turn_success,
                     blocked_by=turn_blocked, attacker=attacker_msg, target=visible_target,
                 )
 
@@ -140,5 +152,5 @@ def run_trial(
     return TrialResult(
         scenario_id=scenario.id, technique_id=technique.id, mode=mode, condition=condition,
         success=success, turns_used=len(transcript), blocked_by=None if success else blocked_by,
-        transcript=transcript,
+        transcript=transcript, replicate=replicate, target=target_model,
     )

@@ -45,12 +45,12 @@ class InputClassifier:
         self._client = client
         self._model = model
 
-    def flag(self, message: str) -> bool:
+    def flag(self, message: str, *, temperature: float = 0.0, salt: str = "") -> bool:
         resp = self._client.complete(
             model=self._model,
             system=_CLASSIFIER_SYSTEM,
             messages=[{"role": "user", "content": message}],
-            max_tokens=_CLASSIFIER_MAX_TOKENS,
+            max_tokens=_CLASSIFIER_MAX_TOKENS, temperature=temperature, salt=salt,
         )
         return resp.text.strip().upper().startswith("YES")
 
@@ -71,8 +71,10 @@ class DefenseStack:
         self._classifier = classifier
         self._output_scan = output_scan
 
-    def classify(self, message: str) -> str | None:
-        if self._classifier is not None and self._classifier.flag(message):
+    def classify(self, message: str, *, temperature: float = 0.0, salt: str = "") -> str | None:
+        if self._classifier is not None and self._classifier.flag(
+            message, temperature=temperature, salt=salt
+        ):
             return "input_classifier"
         return None
 

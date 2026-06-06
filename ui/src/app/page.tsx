@@ -6,6 +6,7 @@ import { AsrHero } from '@/components/AsrHero'
 import { TechniqueHeatmap } from '@/components/TechniqueHeatmap'
 import { DefenseAblation } from '@/components/DefenseAblation'
 import { AttackLog } from '@/components/AttackLog'
+import { CrossModel } from '@/components/CrossModel'
 
 export default function HomePage() {
   const [data, setData] = useState<AegisData | null>(null)
@@ -155,6 +156,7 @@ export default function HomePage() {
         <main className="max-w-screen-xl mx-auto px-6 py-8 space-y-10">
           {/* Section 1: ASR Hero */}
           <AsrHero adaptationLift={data.adaptation_lift} defenseCurve={data.defense_curve} />
+          {data.cross_model && <CrossModel cross={data.cross_model} />}
 
           {/* Section 2: Heatmap */}
           <TechniqueHeatmap

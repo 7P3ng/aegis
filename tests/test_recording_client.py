@@ -9,7 +9,7 @@ from evals.run_gauntlet import RecordingClient
 
 
 class _Boom:
-    def complete(self, *, model, system, messages, max_tokens):
+    def complete(self, *, model, system, messages, max_tokens, temperature=0.0, salt=""):
         raise ModelError("upstream down")
 
 
@@ -37,7 +37,7 @@ def test_cost_cap_raises_once_exceeded():
     from core.types import ModelResponse
 
     class _Pricey:
-        def complete(self, *, model, system, messages, max_tokens):
+        def complete(self, *, model, system, messages, max_tokens, temperature=0.0, salt=""):
             return ModelResponse(text="ok", model="deepseek-chat", input_tokens=1000,
                                  output_tokens=1000, cost_usd=0.50, latency_ms=1.0)
 

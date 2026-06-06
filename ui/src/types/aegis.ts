@@ -34,6 +34,16 @@ export interface AegisData {
   heatmap_adaptive_none: HeatmapCell[]
   heatmap_single_none: HeatmapCell[]
   trials: Trial[]
+  cross_model?: {
+    targets: string[]
+    rows: {
+      label: string
+      by_target: Record<string, { asr: number; ci: [number, number]; successes: number; n: number }>
+      p_value?: number
+      significant_at_05?: boolean
+    }[]
+  }
+  targets_available?: string[]
 }
 
 export interface HeatmapCell {

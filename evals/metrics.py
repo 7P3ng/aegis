@@ -57,9 +57,9 @@ def mcnemar(trials: list[TrialResult]) -> dict[str, Any]:
     """Paired single-vs-adaptive significance at defense=none. The trials are paired by
     (scenario, technique), so McNemar's test on the discordant cells is the correct test for
     the adaptation claim -- not a comparison of two overlapping marginal CIs."""
-    cells: dict[tuple[str, str], dict[str, bool]] = {}
+    cells: dict[tuple[str, str, int], dict[str, bool]] = {}
     for t in select(trials, condition="none"):
-        cells.setdefault((t.scenario_id, t.technique_id), {})[t.mode] = t.success
+        cells.setdefault((t.scenario_id, t.technique_id, t.replicate), {})[t.mode] = t.success
     b = sum(1 for v in cells.values() if v.get("adaptive") and not v.get("single"))
     c = sum(1 for v in cells.values() if v.get("single") and not v.get("adaptive"))
     p = _mcnemar_exact_p(b, c)
@@ -112,14 +112,77 @@ def defense_curve(trials: list[TrialResult]) -> dict[str, Any]:
 def heatmap(
     trials: list[TrialResult], *, mode: str = "adaptive", condition: str = "none"
 ) -> list[dict[str, Any]]:
-    """Per-(scenario, technique) outcome for one mode/condition slice (one trial per cell)."""
-    cells = []
+    """Per-(scenario, technique) ASR for one mode/condition slice, averaged over replicates."""
+    from collections import defaultdict
+    groups: dict[tuple[str, str], list[TrialResult]] = defaultdict(list)
     for t in select(trials, mode=mode, condition=condition):
+        groups[(t.scenario_id, t.technique_id)].append(t)
+    cells = []
+    for (scenario, technique), ts in groups.items():
+        successes = sum(1 for x in ts if x.success)
         cells.append({
-            "scenario": t.scenario_id,
-            "technique": t.technique_id,
-            "success": t.success,
-            "turns_used": t.turns_used,
-            "blocked_by": t.blocked_by,
+            "scenario": scenario,
+            "technique": technique,
+            "asr": round(successes / len(ts), 4),
+            "successes": successes,
+            "n": len(ts),
+            "success": successes > 0,  # binary "ever landed" view
         })
     return cells
+
+
+def _kind_of(scenario_id: str) -> str:
+    return "canary" if scenario_id.startswith("canary") else "injection"
+
+
+def slice_asr(
+    trials: list[TrialResult], *, mode: str, condition: str, kind: str | None = None,
+) -> dict[str, Any]:
+    """ASR (+ CI, successes, n) for a mode/condition slice, optionally restricted to a scenario
+    kind ('canary' | 'injection')."""
+    sel = select(trials, mode=mode, condition=condition)
+    if kind is not None:
+        sel = [t for t in sel if _kind_of(t.scenario_id) == kind]
+    flags = [t.success for t in sel]
+    succ = sum(flags)
+    n = len(flags)
+    lo, hi = bootstrap_ci(flags)
+    return {"asr": round(succ / n, 4) if n else 0.0, "ci": [lo, hi], "successes": succ, "n": n}
+
+
+def two_proportion_p(s1: int, n1: int, s2: int, n2: int) -> float:
+    """Two-sided z-test p-value for the difference of two proportions (pooled SE, normal approx)."""
+    if n1 == 0 or n2 == 0:
+        return 1.0
+    p1, p2 = s1 / n1, s2 / n2
+    p = (s1 + s2) / (n1 + n2)
+    se = (p * (1 - p) * (1 / n1 + 1 / n2)) ** 0.5
+    if se == 0:
+        return 1.0
+    z = abs(p1 - p2) / se
+    phi = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+    return round(2 * (1 - phi), 4)
+
+
+_CROSS_METRICS = [
+    ("Injection ASR (adaptive, undefended)", "adaptive", "none", "injection"),
+    ("Canary ASR (adaptive, undefended)", "adaptive", "none", "canary"),
+    ("Overall ASR (adaptive, undefended)", "adaptive", "none", None),
+    ("ASR with full defense stack", "adaptive", "prompt+classifier+scan", None),
+]
+
+
+def cross_model_compare(by_target: dict[str, list[TrialResult]]) -> dict[str, Any]:
+    """Compare targets on key ASR slices; for exactly two targets add a two-proportion test."""
+    targets = list(by_target)
+    rows = []
+    for label, mode, cond, kind in _CROSS_METRICS:
+        bt = {t: slice_asr(by_target[t], mode=mode, condition=cond, kind=kind) for t in targets}
+        row: dict[str, Any] = {"label": label, "by_target": bt}
+        if len(targets) == 2:
+            a, b = targets
+            p = two_proportion_p(bt[a]["successes"], bt[a]["n"], bt[b]["successes"], bt[b]["n"])
+            row["p_value"] = p
+            row["significant_at_05"] = p < 0.05
+        rows.append(row)
+    return {"targets": targets, "rows": rows}

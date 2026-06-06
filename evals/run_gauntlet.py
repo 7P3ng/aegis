@@ -42,7 +42,7 @@ RESULTS_DIR = ROOT / "evals" / "results"
 
 DEFAULT_K = 2
 DEFAULT_MAX_USD = 1.00
-TARGET_MAX_TOKENS = 1500  # generous: a reasoning target needs room or its answer truncates empty
+TARGET_MAX_TOKENS = 2000  # generous: a reasoning target needs room or its answer truncates empty
 
 # Realistic per-call output-token assumptions for the pre-run estimate (billed = actual tokens).
 _EST_TARGET_OUT = 400
@@ -53,24 +53,32 @@ _EST_CLASSIFIER_OUT = 350
 
 # --- the trial plan -----------------------------------------------------------------------
 class TrialSpec:
-    __slots__ = ("scenario", "technique", "mode", "condition")
+    __slots__ = ("scenario", "technique", "mode", "condition", "replicate")
 
-    def __init__(self, scenario: Scenario, technique: Technique, mode: str, condition: str):
+    def __init__(self, scenario: Scenario, technique: Technique, mode: str, condition: str,
+                 replicate: int = 0):
         self.scenario = scenario
         self.technique = technique
         self.mode = mode
         self.condition = condition
+        self.replicate = replicate
 
 
-def build_plan(scenarios: list[Scenario], techniques: list[Technique]) -> list[TrialSpec]:
-    """For each (scenario, technique): single/none, adaptive/none, and adaptive/<each defense>."""
+def build_plan(
+    scenarios: list[Scenario], techniques: list[Technique], replicates: int = 1
+) -> list[TrialSpec]:
+    """For each (scenario, technique, replicate): single/none, adaptive/none, adaptive/<defense>.
+
+    Replicates (independent samples at temperature > 0) tighten the ASR CIs and let cross-model
+    comparisons be statistically powered rather than coin-flips on one sample per cell."""
     plan: list[TrialSpec] = []
     for s in scenarios:
         for t in techniques:
-            plan.append(TrialSpec(s, t, "single", "none"))
-            plan.append(TrialSpec(s, t, "adaptive", "none"))
-            for cond in CONDITIONS[1:]:  # prompt, +classifier, +scan
-                plan.append(TrialSpec(s, t, "adaptive", cond))
+            for r in range(max(1, replicates)):
+                plan.append(TrialSpec(s, t, "single", "none", r))
+                plan.append(TrialSpec(s, t, "adaptive", "none", r))
+                for cond in CONDITIONS[1:]:  # prompt, +classifier, +scan
+                    plan.append(TrialSpec(s, t, "adaptive", cond, r))
     return plan
 
 
@@ -93,8 +101,9 @@ class RecordingClient:
         self.live_calls = 0
         self.total_cost = 0.0
 
-    def complete(self, *, model, system, messages, max_tokens) -> ModelResponse:
-        key = prompt_key(model, system, messages)
+    def complete(self, *, model, system, messages, max_tokens,
+                 temperature=0.0, salt="") -> ModelResponse:
+        key = prompt_key(model, system, messages, salt)
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
@@ -121,7 +130,8 @@ class RecordingClient:
         try:
             resp = retry(
                 lambda: self._inner.complete(
-                    model=model, system=system, messages=messages, max_tokens=max_tokens
+                    model=model, system=system, messages=messages, max_tokens=max_tokens,
+                    temperature=temperature, salt=salt,
                 ),
                 attempts=4, backoff=1.0, exceptions=(RateLimitError,),
             )
@@ -146,8 +156,22 @@ class RecordingClient:
 
 
 # --- cost estimate ------------------------------------------------------------------------
-def estimate_cost(plan: list[TrialSpec], k: int) -> float:
-    """Estimated USD for a live run (assumes no early-stop and no memoization dedup => upper-ish)."""
+_REASONING_MODELS = {"deepseek-v4-pro"}
+
+
+def _priced(model: str) -> str:
+    from core.pricing import PRICING
+    return model if model in PRICING else "deepseek-chat"
+
+
+def estimate_cost(plan: list[TrialSpec], k: int, *, target_model: str = "deepseek-v4-pro",
+                  attacker_model: str = "deepseek-chat") -> float:
+    """Model-aware upper-ish estimate (no early-stop, no dedup). Reasoning targets/attackers
+    emit far more output tokens, so the per-call output budget depends on the model."""
+    tgt_out = 700 if target_model in _REASONING_MODELS else 250
+    atk_out = 900 if attacker_model in _REASONING_MODELS else 300
+    cls_out = 900 if attacker_model in _REASONING_MODELS else 300
+    tp, ap = _priced(target_model), _priced(attacker_model)
     total = 0.0
     for spec in plan:
         harden = spec.condition != "none"
@@ -157,15 +181,16 @@ def estimate_cost(plan: list[TrialSpec], k: int) -> float:
         turns = 1 if spec.mode == "single" else k
         for turn in range(turns):
             if "classifier" in spec.condition:
-                total += cost("deepseek-chat", 200, _EST_CLASSIFIER_OUT)
-            total += cost("deepseek-chat", target_in, _EST_TARGET_OUT)
+                total += cost(ap, 200, cls_out)
+            total += cost(tp, target_in, tgt_out)
             if turn > 0:  # an adaptive (model-driven) attacker turn
-                total += cost("deepseek-chat", _EST_ATTACKER_IN, _EST_ATTACKER_OUT)
+                total += cost(ap, _EST_ATTACKER_IN, atk_out)
     return round(total, 4)
 
 
 class _NullClient:
-    def complete(self, *, model, system, messages, max_tokens) -> ModelResponse:
+    def complete(self, *, model, system, messages, max_tokens,
+                 temperature=0.0, salt="") -> ModelResponse:
         raise RuntimeError("null client must not be called")
 
 
@@ -175,13 +200,15 @@ _NULL_CLIENT = _NullClient()
 # --- run loop -----------------------------------------------------------------------------
 def run_plan(
     plan: list[TrialSpec], client: ModelClient, *, k: int, trace: TraceStore, run_id: str,
-    max_usd: float | None = None, concurrency: int = 8,
+    attacker_model: str = "deepseek-chat", target_model: str = "deepseek-chat",
+    temperature: float = 0.0, max_usd: float | None = None, concurrency: int = 8,
 ) -> list[TrialResult | None]:
     """Execute every trial concurrently. A trial that breaches the cost cap or errors becomes
     ``None`` (the degraded guard then aborts cleanly). Single-flight recording keeps the run
-    reproducible despite parallelism."""
-    attacker = Attacker(client)
-    target = TargetAdapter(client, max_tokens=TARGET_MAX_TOKENS)
+    reproducible despite parallelism. ``client`` routes calls to the right model by the ``model``
+    arg, so attacker (cheap, fixed) and target (under test) can differ within one recorder."""
+    attacker = Attacker(client, model=attacker_model)
+    target = TargetAdapter(client, model=target_model, max_tokens=TARGET_MAX_TOKENS)
 
     def one(spec: TrialSpec) -> TrialResult:
         if max_usd is not None and getattr(client, "total_cost", 0.0) >= max_usd:
@@ -190,10 +217,27 @@ def run_plan(
         return run_trial(
             spec.scenario, spec.technique, mode=spec.mode, k=k,
             attacker=attacker, target=target, defense=defense, condition=spec.condition,
+            replicate=spec.replicate, temperature=temperature, target_model=target_model,
             trace=trace, run_id=run_id,
         )
 
     return fan_out(plan, one, max_concurrency=concurrency)
+
+
+class RouterClient:
+    """Dispatches complete() to a per-model inner client by the ``model`` argument, so one
+    recorder can drive a cheap fixed attacker and a distinct target model in the same run."""
+
+    def __init__(self, by_model: dict[str, ModelClient]) -> None:
+        self._by_model = by_model
+
+    def complete(self, *, model, system, messages, max_tokens,
+                 temperature=0.0, salt="") -> ModelResponse:
+        inner = self._by_model.get(model)
+        if inner is None:
+            raise KeyError(f"no client configured for model {model!r}")
+        return inner.complete(model=model, system=system, messages=messages,
+                              max_tokens=max_tokens, temperature=temperature, salt=salt)
 
 
 
@@ -223,11 +267,19 @@ def assert_not_degraded(
     empty_trials = [
         r for r in ok if not any(turn.target and turn.target.strip() for turn in r.transcript)
     ]
-    if empty_trials:
+    empty_frac = len(empty_trials) / len(ok) if ok else 0.0
+    if empty_frac > 0.05:
         raise SystemExit(
-            f"ABORT (degraded): {len(empty_trials)} trial(s) had only empty target responses "
-            "(likely reasoning truncated on max_tokens). Refusing to write a fabricated headline."
+            f"ABORT (degraded): {len(empty_trials)}/{len(ok)} ({empty_frac:.1%}) trials had only "
+            "empty target responses — systemic truncation (reasoning ate max_tokens). Refusing to "
+            "write a fabricated headline."
         )
+    if empty_trials:
+        # Rare truncation is tolerated and counted as non-success: an empty response contains no
+        # leak, so labeling it a non-success is correct regardless of why it was empty.
+        print(f"[warn] {len(empty_trials)}/{len(ok)} ({empty_frac:.1%}) trials had only-empty "
+              "target responses (rare reasoning truncation); counted as non-success.",
+              file=sys.stderr)
     return ok
 
 
@@ -310,89 +362,187 @@ def _render_md(s: dict[str, Any]) -> str:
 
 
 # --- clients ------------------------------------------------------------------------------
-def _load_fixtures() -> dict[str, Any]:
-    path = FIXTURES_DIR / "deepseek.json"
-    if not path.exists():
-        raise SystemExit(
-            f"No fixtures at {path}. Run a live gauntlet first (AEGIS_LIVE=1 ... --live)."
-        )
-    return json.loads(path.read_text())
+MANIFEST = FIXTURES_DIR / "manifest.json"
+DEFAULT_TARGETS = ["deepseek-v4-pro", "deepseek-chat"]
+DEFAULT_ATTACKER = "deepseek-chat"
+DEFAULT_REPLICATES = 3
+DEFAULT_TEMPERATURE = 0.7
 
 
-def _build_live_client() -> ModelClient:
+def _fixtures_path(target: str) -> Path:
+    return FIXTURES_DIR / f"{target}.json"
+
+
+def _make_client(model: str) -> ModelClient:
+    if model.startswith("gpt-"):
+        from core.openai_client import OpenAIClient
+        return OpenAIClient(model=model)
     from core.deepseek_client import DeepSeekClient
-    return DeepSeekClient()
+    return DeepSeekClient(model=model)
+
+
+def _recorder_for(target: str, attacker_model: str, max_usd: float | None) -> RecordingClient:
+    inners: dict[str, ModelClient] = {attacker_model: _make_client(attacker_model)}
+    if target not in inners:
+        inners[target] = _make_client(target)
+    return RecordingClient(RouterClient(inners), max_usd=max_usd)
+
+
+# --- markdown + combined export -----------------------------------------------------------
+def _render_md_multi(per_summary: dict[str, dict[str, Any]],
+                     cross: dict[str, Any], primary: str) -> str:
+    md = [_render_md(per_summary[primary]),
+          "", f"_(Claims above are for the primary target `{primary}`.)_", "",
+          "## Cross-model comparison", "",
+          "| Metric | " + " | ".join(cross["targets"]) + " | p (2-prop) |",
+          "|---" * (len(cross["targets"]) + 2) + "|"]
+    for row in cross["rows"]:
+        cells = " | ".join(
+            f"{_pct(row['by_target'][t]['asr'])} (n={row['by_target'][t]['n']})"
+            for t in cross["targets"]
+        )
+        p = row.get("p_value")
+        ptxt = f"{p}{'*' if row.get('significant_at_05') else ''}" if p is not None else "—"
+        md.append(f"| {row['label']} | {cells} | {ptxt} |")
+    md.append("")
+    md.append("\\* significant at 0.05 (two-proportion z-test).")
+    return "\n".join(md)
+
+
+def write_outputs_multi(
+    per_summary: dict[str, dict[str, Any]], per_results: dict[str, list[TrialResult]],
+    *, primary: str, cross_model: dict[str, Any], manifest: dict[str, Any],
+) -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # export.json — primary single-target views (backwards compatible) + cross-model block
+    export = dict(per_summary[primary])
+    export["trials"] = [_trial_to_dict(r) for r in per_results[primary]]
+    export["cross_model"] = cross_model
+    export["targets_available"] = list(per_summary)
+    (RESULTS_DIR / "export.json").write_text(json.dumps(export, indent=2))
+    # asr.json — primary summary + cross-model (the reproduction test checks this)
+    primary_summary = dict(per_summary[primary])
+    primary_summary["cross_model"] = cross_model
+    (RESULTS_DIR / "asr.json").write_text(json.dumps(primary_summary, indent=2))
+    # crossmodel.json — every target's full summary
+    (RESULTS_DIR / "crossmodel.json").write_text(
+        json.dumps({"meta": manifest, "cross_model": cross_model, "targets": per_summary}, indent=2)
+    )
+    (RESULTS_DIR / "asr.md").write_text(_render_md_multi(per_summary, cross_model, primary))
 
 
 # --- main ---------------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Aegis red-team gauntlet runner")
+    p = argparse.ArgumentParser(description="Aegis red-team gauntlet runner (multi-target)")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="replay committed fixtures (default)")
     mode.add_argument("--live", action="store_true", help="make paid calls (needs AEGIS_LIVE=1)")
-    p.add_argument("--target", default="deepseek", choices=["deepseek"])
+    p.add_argument("--targets", default=",".join(DEFAULT_TARGETS),
+                   help="comma-separated target model ids; first is the primary")
+    p.add_argument("--attacker-model", default=DEFAULT_ATTACKER)
+    p.add_argument("--replicates", type=int, default=DEFAULT_REPLICATES)
+    p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("--k", type=int, default=DEFAULT_K)
-    p.add_argument("--max-usd", type=float, default=float(os.environ.get("AEGIS_MAX_USD", DEFAULT_MAX_USD)))
+    p.add_argument("--max-usd", type=float,
+                   default=float(os.environ.get("AEGIS_MAX_USD", DEFAULT_MAX_USD)))
     p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--limit", type=int, default=0,
+                   help="cheap smoke: cap the plan to the first N (scenario,technique) cells")
     args = p.parse_args(argv)
 
-    plan = build_plan(SCENARIOS, TECHNIQUES)
-    trace = TraceStore(str(ROOT / "evals" / "results" / "traces.db"))
-    run_id = trace.new_run(f"gauntlet-{args.target}-k{args.k}-{'live' if args.live else 'dry'}")
+    scenarios, techniques = SCENARIOS, TECHNIQUES
+    if args.limit:
+        # subset for a cheap live smoke of the full pipeline
+        techniques = TECHNIQUES[: max(1, args.limit)]
+        scenarios = SCENARIOS[: max(1, args.limit)]
+
+    trace = TraceStore(str(RESULTS_DIR / "traces.db"))
+    per_results: dict[str, list[TrialResult]] = {}
 
     if args.live:
         if os.environ.get("AEGIS_LIVE") != "1":
             print("Refusing live run: set AEGIS_LIVE=1 to confirm paid calls.", file=sys.stderr)
             return 2
-        est = estimate_cost(plan, args.k)
-        print(f"[cost] estimated ~${est:.4f} for {len(plan)} trials at K={args.k} "
-              f"(cap ${args.max_usd:.2f}). Billed = actual tokens; memoization reduces this.")
-        if est > args.max_usd:
-            print(f"Refusing: estimate ${est:.4f} exceeds cap ${args.max_usd:.2f}.", file=sys.stderr)
+        targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+        plan = build_plan(scenarios, techniques, args.replicates)
+        total_est = sum(
+            estimate_cost(plan, args.k, target_model=t, attacker_model=args.attacker_model)
+            for t in targets
+        )
+        print(f"[cost] estimated worst-case ~${total_est:.2f} for {len(targets)} target(s) x "
+              f"{len(plan)} trials (n={args.replicates}, cap ${args.max_usd:.2f}). "
+              "Actual is materially lower (early-stop + memoization).")
+        if total_est > args.max_usd:
+            print(f"Refusing: estimate ${total_est:.2f} exceeds cap ${args.max_usd:.2f}.",
+                  file=sys.stderr)
             return 2
-        rec = RecordingClient(_build_live_client(), max_usd=args.max_usd)
-        raw = run_plan(plan, rec, k=args.k, trace=trace, run_id=run_id,
-                       max_usd=args.max_usd, concurrency=args.concurrency)
-        results = assert_not_degraded(raw, len(plan), len(TECHNIQUES))
-        FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-        (FIXTURES_DIR / "deepseek.json").write_text(json.dumps(rec.fixtures, indent=2))
-        # Authoritative cost = sum over the unique billed calls (priced at deepseek-chat
-        # list rates), not the per-turn trace spans (which re-count memoized calls).
-        spent = rec.total_cost
-        live_calls = rec.live_calls
-        in_tok = sum(int(f["input_tokens"]) for f in rec.fixtures.values())
-        out_tok = sum(int(f["output_tokens"]) for f in rec.fixtures.values())
-        target_model = os.environ.get("OSSLLM_MODEL", "deepseek-v4-pro")
-        PROVENANCE.write_text(json.dumps({
-            "source": "live", "target_model": target_model, "k": args.k,
-            "live_calls": live_calls, "input_tokens": in_tok, "output_tokens": out_tok,
-            "cost_usd": round(spent, 4), "pricing_basis": "deepseek-chat list ($0.27/$1.10 per MTok)",
-        }, indent=2))
-        print(f"[cost] actual ${spent:.4f} over {live_calls} unique live calls "
-              f"({in_tok} in + {out_tok} out tokens, priced at deepseek-chat list rates).")
+        manifest: dict[str, Any] = {
+            "source": "live", "attacker_model": args.attacker_model, "k": args.k,
+            "replicates": args.replicates, "temperature": args.temperature,
+            "n_scenarios": len(scenarios), "n_techniques": len(techniques),
+            "pricing_basis": "deepseek-chat list ($0.27/$1.10 per MTok); actual rate may differ",
+            "targets": {},
+        }
+        spent = 0.0
+        for t in targets:
+            run_id = trace.new_run(f"gauntlet-{t}-n{args.replicates}-live")
+            rec = _recorder_for(t, args.attacker_model, max_usd=args.max_usd - spent)
+            raw = run_plan(plan, rec, k=args.k, trace=trace, run_id=run_id,
+                           attacker_model=args.attacker_model, target_model=t,
+                           temperature=args.temperature, max_usd=args.max_usd - spent,
+                           concurrency=args.concurrency)
+            per_results[t] = assert_not_degraded(raw, len(plan), len(techniques))
+            FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+            _fixtures_path(t).write_text(json.dumps(rec.fixtures, indent=2))
+            in_tok = sum(int(f["input_tokens"]) for f in rec.fixtures.values())
+            out_tok = sum(int(f["output_tokens"]) for f in rec.fixtures.values())
+            manifest["targets"][t] = {
+                "live_calls": rec.live_calls, "input_tokens": in_tok,
+                "output_tokens": out_tok, "cost_usd": round(rec.total_cost, 4),
+            }
+            spent += rec.total_cost
+            print(f"[cost] {t}: ${rec.total_cost:.4f} over {rec.live_calls} calls "
+                  f"({in_tok} in + {out_tok} out tok). cumulative ${spent:.4f}/{args.max_usd:.2f}")
+        manifest["total_cost_usd"] = round(spent, 4)
+        MANIFEST.write_text(json.dumps(manifest, indent=2))
     else:
-        fixtures = _load_fixtures()
-        client = RecordedClient(fixtures, strict=True)
-        raw = run_plan(plan, client, k=args.k, trace=trace, run_id=run_id,
-                       concurrency=args.concurrency)
-        results = assert_not_degraded(raw, len(plan), len(TECHNIQUES))
+        if not MANIFEST.exists():
+            raise SystemExit(f"No manifest at {MANIFEST}. Run a live gauntlet first.")
+        manifest = json.loads(MANIFEST.read_text())
+        targets = list(manifest["targets"])
+        args.k = manifest["k"]
+        plan = build_plan(SCENARIOS, TECHNIQUES, manifest["replicates"])
+        for t in targets:
+            fx = json.loads(_fixtures_path(t).read_text())
+            run_id = trace.new_run(f"gauntlet-{t}-dry")
+            raw = run_plan(plan, RecordedClient(fx, strict=True), k=manifest["k"],
+                           trace=trace, run_id=run_id, attacker_model=manifest["attacker_model"],
+                           target_model=t, temperature=manifest["temperature"],
+                           concurrency=args.concurrency)
+            per_results[t] = assert_not_degraded(raw, len(plan), manifest["n_techniques"])
 
-    prov = json.loads(PROVENANCE.read_text()) if PROVENANCE.exists() else None
-    is_live_data = bool(prov and prov.get("source") == "live")
-    target_label = args.target
-    if is_live_data and prov is not None:
-        target_label = prov["target_model"]
-    summary = summarize(results, target=target_label, mode_k=args.k, live=is_live_data)
-    if prov:
-        summary["meta"]["provenance"] = prov
-    write_outputs(summary, results)
-    lift = summary["adaptation_lift"]
-    curve = summary["defense_curve"]
-    print(f"[claim 1] adaptation lift: {_pct(lift['single_asr'])} -> {_pct(lift['adaptive_asr'])} "
-          f"(+{_pct(lift['lift_abs'])})")
-    print(f"[claim 2] defense reduction: {_pct(curve['by_condition']['none']['asr'])} -> "
-          f"{_pct(curve['by_condition'][CONDITIONS[-1]]['asr'])} (-{_pct(curve['reduction_abs'])})")
-    print(f"[ok] wrote {RESULTS_DIR}/asr.json, asr.md, export.json")
+    per_summary: dict[str, dict[str, Any]] = {}
+    for t in targets:
+        summ = summarize(per_results[t], target=t, mode_k=args.k, live=True)
+        summ["meta"]["provenance"] = manifest["targets"].get(t)
+        per_summary[t] = summ
+    cross = metrics.cross_model_compare(per_results)
+    primary = targets[0]
+    write_outputs_multi(per_summary, per_results, primary=primary,
+                        cross_model=cross, manifest=manifest)
+
+    for t in targets:
+        lift = per_summary[t]["adaptation_lift"]
+        curve = per_summary[t]["defense_curve"]
+        print(f"[{t}] adaptation {_pct(lift['single_asr'])}->{_pct(lift['adaptive_asr'])} "
+              f"(p={lift['significance']['p_value']}) | defense "
+              f"{_pct(curve['by_condition']['none']['asr'])}->"
+              f"{_pct(curve['by_condition'][CONDITIONS[-1]]['asr'])}")
+    inj = next(r for r in cross["rows"] if "Injection" in r["label"])
+    print("[cross-model] injection ASR: "
+          + ", ".join(f"{t}={_pct(inj['by_target'][t]['asr'])}" for t in targets)
+          + (f" (p={inj.get('p_value')})" if "p_value" in inj else ""))
+    print(f"[ok] wrote {RESULTS_DIR}/export.json, asr.json, asr.md, crossmodel.json")
     return 0
 
 

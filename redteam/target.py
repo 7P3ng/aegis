@@ -53,13 +53,14 @@ class TargetAdapter:
         return system, user_content
 
     def run_turn(
-        self, scenario: Scenario, attacker_msg: str, *, harden: bool = False
+        self, scenario: Scenario, attacker_msg: str, *, harden: bool = False,
+        temperature: float = 0.0, salt: str = "",
     ) -> ModelResponse:
         """Call the target with the scenario policy + attack message; return its response."""
         system, user_content = self._build(scenario, attacker_msg, harden)
         return self._client.complete(
-            model=self._model,  # a real priced model id; scenario is recorded in trace attrs
+            model=self._model,  # the target model id; scenario is recorded in trace attrs
             system=system,
             messages=[{"role": "user", "content": user_content}],
-            max_tokens=self._max_tokens,
+            max_tokens=self._max_tokens, temperature=temperature, salt=salt,
         )

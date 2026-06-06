@@ -1,9 +1,10 @@
 # Aegis — Automated Red-Team Gauntlet
 
-An adaptive attacker **agent** red-teams a target model on two harmless proxy threats, scored
+An adaptive attacker **agent** red-teams target models on two harmless proxy threats, scored
 **deterministically**; layered defenses then measurably reduce the attack-success rate (ASR).
-Two headline numbers, both produced by the harness and reproducible from committed fixtures at
-zero cost.
+Three results, all produced by the harness and reproducible from committed fixtures at zero cost:
+a statistically-significant adaptation lift, a −28% layered-defense reduction, and a significant
+**cross-model** robustness gap (a reasoning model resists attacks better — until defended).
 
 **▶ Live dashboard: https://7p3ng.github.io/aegis/**
 
@@ -21,36 +22,40 @@ zero cost.
 
 ## Headline results
 
-Target **`deepseek-v4-pro`**, one live run: 360 trials, 591 unique calls, **~$0.51** (143K input
-+ 431K output tokens priced at deepseek-chat list rates), K = 2. Seeded 95% bootstrap CIs over
-72 cells per condition — coarse (≈±10%), so treat point estimates as directional. Reproduce
-with `make eval-dry`.
+Benchmark: **12 scenarios** (6 canary + 6 injection) × **12 techniques** × **n=2 replicates**
+at temperature 0.7, K=2, attacker = `deepseek-chat` (fixed, so we compare *target* robustness).
+Two targets, **one live run, $1.00 total** (`deepseek-v4-pro` $0.73 + `deepseek-chat` $0.27,
+priced at deepseek-chat list rates). Seeded 95% bootstrap CIs; paired McNemar for adaptation;
+two-proportion z-tests for cross-model. Reproduce with `make eval-dry`.
 
-**1. Adaptation lift — a null result, reported honestly.** At defense = none, a 2-turn adaptive
-attacker moved ASR from **27.8%** (single-turn, CI 18.1–38.9%) to **29.2%** (CI 19.4–40.3%):
-**+1.4%**. The trials are paired by (scenario, technique), so the right test is McNemar's on the
-discordant cells — and there is exactly one (b=1 fail→success, c=0, **exact p = 1.0**): **not
-statistically significant.** Adaptive ASR ≥ single-turn ASR by construction (turn 0 *is* the
-baseline), so this verifies the harness rather than demonstrating an adaptation effect. The
-lever is a deeper attacker (larger K / diversity search) — left as future work; the harness
-already takes `--k`.
+**1. Adaptation lift (statistically significant).** On the primary target `deepseek-v4-pro`, a
+2-turn adaptive attacker raised ASR from **24.0%** (single-turn, CI 19.1–28.8%) to **29.9%**
+(CI 24.3–35.1%) — **+5.9%**. The trials are paired by (scenario, technique, replicate); McNemar
+on the discordant cells gives **b=17, c=0, p≈0 — significant** at 0.05. (At the original tiny
+benchmark this same effect was a single discordant cell, p=1.0; scaling is what made it
+measurable — see the writeup.)
 
-**2. Defense reduction — the real result.** A layered defense cut adaptive ASR
-**29.2% → 4.2% (−25.0%)**; the none vs full-stack CIs are well separated (19.4–40.3% vs
-0.0–8.3%). Per-layer marginals are *directional* (adjacent-condition CIs overlap):
+**2. Defense reduction.** A layered defense cut adaptive ASR **29.9% → 1.7% (−28.1%)** on the
+primary target. Per-layer marginals: prompt-hardening −12.2%, input classifier −15.6%, output
+canary-scan −0.3% (the scan is small because hardening + classifier already block most attacks;
+adjacent-condition CIs overlap, so treat marginals as directional).
 
-| Condition | ASR | marginal |
-|---|---|---|
-| none | 29.2% | — |
-| + prompt-hardening | 19.4% | −9.7% |
-| + input classifier | 5.6% | −13.9% |
-| + output canary-scan | 4.2% | −1.4% |
+**3. Cross-model: the reasoning model is significantly more robust.** Same attacker, two
+targets, adaptive + undefended:
 
-The model guards an explicitly-held secret well (**canary ASR 8%**) but is far more vulnerable
-to instructions hidden in untrusted data (**injection ASR 50%**) — the failure mode real agent
-stacks worry about. Full analysis + threats-to-validity: [`docs/writeup.md`](docs/writeup.md).
+| Metric (adaptive) | `deepseek-v4-pro` | `deepseek-chat` | p (2-prop) |
+|---|---|---|---|
+| Injection ASR | **49.3%** | 68.1% | **0.0012** ✷ |
+| Canary ASR | **10.4%** | 21.5% | **0.010** ✷ |
+| Overall ASR | **29.9%** | 44.8% | **0.0002** ✷ |
+| ASR under full defense stack | 1.7% | 2.8% | 0.40 (n.s.) |
 
-<p align="center"><img src="docs/assets/dashboard.gif" alt="Aegis dashboard walkthrough" width="640"></p>
+The reasoning model (`v4-pro`) resists both injection and canary extraction significantly better
+than the non-reasoning model (`deepseek-chat`) — but the **layered defense erases the gap**
+(1.7% vs 2.8%, not significant). A real comparative safety finding, not three noisy columns:
+n=144–288 per cell. Cross-model targets are DeepSeek-only here to keep cost low; the harness
+takes `--targets` (e.g. `gpt-4o-mini`) when a key is present. Full analysis + threats-to-validity:
+[`docs/writeup.md`](docs/writeup.md).
 
 ## Architecture
 
