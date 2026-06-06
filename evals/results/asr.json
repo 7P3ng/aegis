@@ -17,7 +17,10 @@
       "target_model": "deepseek-v4-pro",
       "k": 2,
       "live_calls": 591,
-      "cost_usd": 0.2018
+      "input_tokens": 143406,
+      "output_tokens": 430754,
+      "cost_usd": 0.5125,
+      "pricing_basis": "deepseek-chat list ($0.27/$1.10 per MTok); actual deepseek-v4-pro rate may differ"
     }
   },
   "adaptation_lift": {
@@ -33,7 +36,14 @@
       0.4028
     ],
     "adaptive_n": 72,
-    "lift_abs": 0.0139
+    "lift_abs": 0.0139,
+    "significance": {
+      "b_single_fail_adaptive_success": 1,
+      "c_single_success_adaptive_fail": 0,
+      "discordant": 1,
+      "p_value": 1.0,
+      "significant_at_05": false
+    }
   },
   "defense_curve": {
     "by_condition": {

@@ -6,7 +6,7 @@
 
 - Single-turn ASR: **27.8%** (95% CI 18.1%–38.9%, n=72)
 - 2-turn adaptive ASR: **29.2%** (95% CI 19.4%–40.3%, n=72)
-- **Adaptation lift: +1.4%**
+- **Adaptation lift: +1.4%** (McNemar exact p=1.0, discordant pairs b=1/c=0 — NOT significant at 0.05)
 
 ## Claim 2 — Defense reduction (adaptive attacker)
 

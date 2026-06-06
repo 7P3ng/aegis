@@ -83,8 +83,9 @@ class RecordingClient:
     replay is exact even under parallelism and model nondeterminism. Rate limits are retried.
     """
 
-    def __init__(self, inner: ModelClient) -> None:
+    def __init__(self, inner: ModelClient, *, max_usd: float | None = None) -> None:
         self._inner = inner
+        self._max_usd = max_usd
         self.fixtures: dict[str, dict[str, Any]] = {}
         self._cache: dict[str, ModelResponse] = {}
         self._inflight: dict[str, threading.Event] = {}
@@ -97,6 +98,12 @@ class RecordingClient:
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
+            # Atomic per-call cost gate: bounds spend to ~concurrency x one-call cost over the
+            # cap, far tighter than a per-trial check (a trial is many calls).
+            if self._max_usd is not None and self.total_cost >= self._max_usd:
+                raise RuntimeError(
+                    f"cost cap ${self._max_usd:.2f} reached (spent ${self.total_cost:.4f})"
+                )
             ev = self._inflight.get(key)
             owner = ev is None
             if owner:
@@ -106,13 +113,24 @@ class RecordingClient:
         if not owner:
             ev.wait()
             with self._lock:
-                return self._cache[key]
-        resp = retry(
-            lambda: self._inner.complete(
-                model=model, system=system, messages=messages, max_tokens=max_tokens
-            ),
-            attempts=4, backoff=1.0, exceptions=(RateLimitError,),
-        )
+                if key in self._cache:
+                    return self._cache[key]
+            # The owner's call failed; don't deadlock or KeyError -- surface a clean error so
+            # fan_out degrades this trial and the degraded guard aborts the run.
+            raise RuntimeError("coalesced upstream call failed")
+        try:
+            resp = retry(
+                lambda: self._inner.complete(
+                    model=model, system=system, messages=messages, max_tokens=max_tokens
+                ),
+                attempts=4, backoff=1.0, exceptions=(RateLimitError,),
+            )
+        except BaseException:
+            # Always release waiters and drop the reservation, then re-raise.
+            with self._lock:
+                self._inflight.pop(key, None)
+            ev.set()
+            raise
         with self._lock:
             self._cache[key] = resp
             self.fixtures[key] = {
@@ -120,6 +138,7 @@ class RecordingClient:
                 "input_tokens": resp.input_tokens, "output_tokens": resp.output_tokens,
                 "latency_ms": resp.latency_ms, "stop_reason": resp.stop_reason,
             }
+            self._inflight.pop(key, None)
             self.live_calls += 1
             self.total_cost += resp.cost_usd
         ev.set()
@@ -198,13 +217,16 @@ def assert_not_degraded(
             f"ABORT (degraded): {len(techniques_attempted)} techniques attempted, "
             f"expected {n_techniques}."
         )
-    non_empty = sum(
-        1 for r in ok for turn in r.transcript if turn.target and turn.target.strip()
-    )
-    if non_empty == 0:
+    # Per-trial (not global) liveness: a truncation symptom is a trial whose every target turn
+    # came back empty. Even a refusal or a defense block is non-empty, so a fully-empty trial
+    # means the model produced nothing -- refuse rather than score it.
+    empty_trials = [
+        r for r in ok if not any(turn.target and turn.target.strip() for turn in r.transcript)
+    ]
+    if empty_trials:
         raise SystemExit(
-            "ABORT (degraded): every target response was empty — likely the reasoning model "
-            "truncated on max_tokens. Refusing to write a 0% headline."
+            f"ABORT (degraded): {len(empty_trials)} trial(s) had only empty target responses "
+            "(likely reasoning truncated on max_tokens). Refusing to write a fabricated headline."
         )
     return ok
 
@@ -265,7 +287,11 @@ def _render_md(s: dict[str, Any]) -> str:
         f"(95% CI {_pct(lift['single_ci'][0])}–{_pct(lift['single_ci'][1])}, n={lift['single_n']})",
         f"- {s['meta']['k']}-turn adaptive ASR: **{_pct(lift['adaptive_asr'])}** "
         f"(95% CI {_pct(lift['adaptive_ci'][0])}–{_pct(lift['adaptive_ci'][1])}, n={lift['adaptive_n']})",
-        f"- **Adaptation lift: +{_pct(lift['lift_abs'])}**", "",
+        f"- **Adaptation lift: +{_pct(lift['lift_abs'])}** "
+        f"(McNemar exact p={lift['significance']['p_value']}, "
+        f"discordant pairs b={lift['significance']['b_single_fail_adaptive_success']}/"
+        f"c={lift['significance']['c_single_success_adaptive_fail']} — "
+        f"{'significant' if lift['significance']['significant_at_05'] else 'NOT significant'} at 0.05)", "",
         "## Claim 2 — Defense reduction (adaptive attacker)", "",
         "| Condition | ASR | 95% CI |", "|---|---|---|",
     ]
@@ -324,20 +350,26 @@ def main(argv: list[str] | None = None) -> int:
         if est > args.max_usd:
             print(f"Refusing: estimate ${est:.4f} exceeds cap ${args.max_usd:.2f}.", file=sys.stderr)
             return 2
-        client: ModelClient = RecordingClient(_build_live_client())
-        raw = run_plan(plan, client, k=args.k, trace=trace, run_id=run_id,
+        rec = RecordingClient(_build_live_client(), max_usd=args.max_usd)
+        raw = run_plan(plan, rec, k=args.k, trace=trace, run_id=run_id,
                        max_usd=args.max_usd, concurrency=args.concurrency)
         results = assert_not_degraded(raw, len(plan), len(TECHNIQUES))
         FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
-        (FIXTURES_DIR / "deepseek.json").write_text(json.dumps(client.fixtures, indent=2))  # type: ignore[attr-defined]
-        spent = sum(s["total_cost_usd"] for s in trace.query_runs() if s["run_id"] == run_id)
-        live_calls = client.live_calls  # type: ignore[attr-defined]
+        (FIXTURES_DIR / "deepseek.json").write_text(json.dumps(rec.fixtures, indent=2))
+        # Authoritative cost = sum over the unique billed calls (priced at deepseek-chat
+        # list rates), not the per-turn trace spans (which re-count memoized calls).
+        spent = rec.total_cost
+        live_calls = rec.live_calls
+        in_tok = sum(int(f["input_tokens"]) for f in rec.fixtures.values())
+        out_tok = sum(int(f["output_tokens"]) for f in rec.fixtures.values())
         target_model = os.environ.get("OSSLLM_MODEL", "deepseek-v4-pro")
         PROVENANCE.write_text(json.dumps({
             "source": "live", "target_model": target_model, "k": args.k,
-            "live_calls": live_calls, "cost_usd": round(spent, 4),
+            "live_calls": live_calls, "input_tokens": in_tok, "output_tokens": out_tok,
+            "cost_usd": round(spent, 4), "pricing_basis": "deepseek-chat list ($0.27/$1.10 per MTok)",
         }, indent=2))
-        print(f"[cost] actual ${spent:.4f} over {live_calls} unique live calls.")
+        print(f"[cost] actual ${spent:.4f} over {live_calls} unique live calls "
+              f"({in_tok} in + {out_tok} out tokens, priced at deepseek-chat list rates).")
     else:
         fixtures = _load_fixtures()
         client = RecordedClient(fixtures, strict=True)

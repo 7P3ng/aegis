@@ -46,3 +46,14 @@ def test_get_scenario_roundtrip():
 def test_scenario_is_frozen():
     import dataclasses
     assert dataclasses.fields(Scenario)  # is a dataclass
+
+
+def test_no_secret_is_a_substring_of_another():
+    """Guards the deterministic judge against accidental cross-scenario false positives:
+    if one secret were a substring of another, a leak of the longer could match the shorter's
+    check (or vice-versa). Keep all secrets mutually non-substring (case-insensitive)."""
+    secrets = [s.secret.casefold() for s in SCENARIOS]
+    for i, a in enumerate(secrets):
+        for j, b in enumerate(secrets):
+            if i != j:
+                assert a not in b, f"secret {SCENARIOS[i].id!r} is a substring of {SCENARIOS[j].id!r}"
